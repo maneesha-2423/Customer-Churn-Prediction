@@ -1,115 +1,172 @@
-"""
-train.py
---------
-Same 4-model comparison as before, but now each model's hyperparameters
-are tuned with GridSearchCV instead of being fixed guesses — this
-mirrors the paper's approach (their Table 2) and gives you a real
-answer to "how did you choose these hyperparameters?" in your viva.
 
-Run after preprocess.py:
-    python train.py
-
-NOTE: grid search takes longer than the old fixed-parameter version
-(several minutes instead of under one). That's expected — it's
-actually searching, not just running once.
-"""
-
-import os
+from pathlib import Path
 import json
 import joblib
-from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier, GradientBoostingClassifier
-from sklearn.model_selection import GridSearchCV, cross_val_score
+import pandas as pd
+
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline as SkPipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.metrics import roc_auc_score
+
+from imblearn.pipeline import Pipeline
+from imblearn.over_sampling import SMOTE
 from xgboost import XGBClassifier
 
-from preprocess import run_preprocessing_pipeline
-from evaluate import evaluate_model
-from statistical_test import run_wilcoxon_tests
+ROOT = Path(__file__).resolve().parents[2]
+DATA_PATH = ROOT / "ml" / "processed" / "cleaned_data.csv"
+MODEL_DIR = ROOT / "ml" / "models"
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-MODELS_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
-BEST_MODEL_PATH = os.path.join(MODELS_DIR, "best_model.pkl")
-METRICS_PATH = os.path.join(MODELS_DIR, "metrics.json")
-STATS_PATH = os.path.join(MODELS_DIR, "statistical_test.json")
+# Load cleaned dataset
+df = pd.read_csv(DATA_PATH)
+X = df.drop(columns=["Churn"])
+y = df["Churn"].astype(int)
 
-RANDOM_STATE = 42
+# Split before fitting preprocessing
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.20, random_state=42, stratify=y
+)
 
-# Smaller, targeted grids — a full grid like the paper's would take hours
-# on a laptop. This covers the parameters that matter most for each model.
-PARAM_GRIDS = {
-    "RandomForest": {
-        "estimator": RandomForestClassifier(random_state=RANDOM_STATE),
-        "params": {"n_estimators": [100, 200], "max_depth": [8, 12, None]},
-    },
-    "AdaBoost": {
-        "estimator": AdaBoostClassifier(random_state=RANDOM_STATE),
-        "params": {"n_estimators": [100, 200, 300], "learning_rate": [0.1, 0.5, 1.0]},
-    },
-    "GradientBoosting": {
-        "estimator": GradientBoostingClassifier(random_state=RANDOM_STATE),
-        "params": {"n_estimators": [100, 200], "learning_rate": [0.05, 0.1], "max_depth": [3, 5]},
-    },
-    "XGBoost": {
-        "estimator": XGBClassifier(eval_metric="logloss", random_state=RANDOM_STATE),
-        "params": {"n_estimators": [100, 200], "learning_rate": [0.05, 0.1], "max_depth": [3, 5]},
-    },
+# Identify column types from training data
+numeric_cols = X_train.select_dtypes(include="number").columns.tolist()
+categorical_cols = [
+    col for col in X_train.columns if col not in numeric_cols
+]
+
+numeric_pipe = SkPipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler()),
+])
+
+categorical_pipe = SkPipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("encoder", OneHotEncoder(handle_unknown="ignore")),
+])
+
+preprocessor = ColumnTransformer([
+    ("numeric", numeric_pipe, numeric_cols),
+    ("categorical", categorical_pipe, categorical_cols),
+])
+
+# Model definitions and parameter grids
+models = {
+    "Logistic Regression": (
+        LogisticRegression(max_iter=2000, random_state=42),
+        {"classifier__C": [0.1, 1.0, 10.0]},
+    ),
+    "Random Forest": (
+        RandomForestClassifier(random_state=42, n_jobs=1),
+        {
+            "classifier__n_estimators": [100, 200],
+            "classifier__max_depth": [None, 10],
+        },
+    ),
+    "Gradient Boosting": (
+        GradientBoostingClassifier(random_state=42),
+        {
+            "classifier__n_estimators": [100, 200],
+            "classifier__learning_rate": [0.05, 0.1],
+        },
+    ),
+    "XGBoost": (
+        XGBClassifier(
+            random_state=42, eval_metric="logloss", n_jobs=1
+        ),
+        {
+            "classifier__n_estimators": [100, 200],
+            "classifier__max_depth": [3, 5],
+            "classifier__learning_rate": [0.05, 0.1],
+        },
+    ),
 }
 
+results = []
+best_score = -1
+best_name = None
+best_pipeline = None
 
-def train_and_compare():
-    os.makedirs(MODELS_DIR, exist_ok=True)
+for name, (model, params) in models.items():
+    print(f"\nTraining {name}...")
 
-    X_train, X_test, y_train, y_test, preprocessor = run_preprocessing_pipeline()
+    pipeline = Pipeline([
+        ("preprocessor", preprocessor),
+        ("smote", SMOTE(random_state=42)),
+        ("classifier", model),
+    ])
 
-    results = {}
-    fitted_models = {}
-    cv_fold_scores = {}  # needed for the Wilcoxon test
+    search = GridSearchCV(
+        pipeline,
+        param_grid=params,
+        scoring="roc_auc",
+        cv=5,
+        n_jobs=-1,
+        refit=True,
+        error_score="raise",
+    )
+    search.fit(X_train, y_train)
 
-    for name, config in PARAM_GRIDS.items():
-        print(f"Tuning {name}...")
-        search = GridSearchCV(
-            config["estimator"], config["params"], scoring="f1", cv=5, n_jobs=-1
-        )
-        search.fit(X_train, y_train)
-        best_model = search.best_estimator_
-        fitted_models[name] = best_model
+    score = float(search.best_score_)
+    print("Best CV ROC-AUC:", round(score, 4))
+    print("Best parameters:", search.best_params_)
 
-        print(f"  Best params: {search.best_params_}")
+    results.append({
+        "model": name,
+        "best_cv_roc_auc": score,
+        "best_params": search.best_params_,
+    })
 
-        fold_scores = cross_val_score(best_model, X_train, y_train, cv=10, scoring="f1")
-        cv_fold_scores[name] = fold_scores.tolist()
+    if score > best_score:
+        best_score = score
+        best_name = name
+        best_pipeline = search.best_estimator_
 
-        test_metrics = evaluate_model(best_model, X_test, y_test)
-        test_metrics["best_params"] = search.best_params_
-        test_metrics["cv_f1_mean"] = round(float(fold_scores.mean()), 4)
-        test_metrics["cv_f1_std"] = round(float(fold_scores.std()), 4)
+# Save selected model and fitted preprocessor
+joblib.dump(
+    best_pipeline.named_steps["preprocessor"],
+    MODEL_DIR / "preprocessor.pkl",
+)
+joblib.dump(
+    best_pipeline.named_steps["classifier"],
+    MODEL_DIR / "best_model.pkl",
+)
 
-        results[name] = test_metrics
-        print(f"  {name}: F1={test_metrics['f1']}, ROC-AUC={test_metrics['roc_auc']}")
+# Save feature names for SHAP
+feature_names = (
+    best_pipeline.named_steps["preprocessor"]
+    .get_feature_names_out()
+    .tolist()
+)
 
-    best_name = max(results, key=lambda n: results[n]["f1"])
-    best_model = fitted_models[best_name]
-    print(f"\nBest model: {best_name} (F1={results[best_name]['f1']})")
+with open(MODEL_DIR / "feature_names.json", "w") as f:
+    json.dump(feature_names, f, indent=2)
 
-    joblib.dump(best_model, BEST_MODEL_PATH)
+# Save comparison results
+with open(MODEL_DIR / "model_comparison.json", "w") as f:
+    json.dump(sorted(
+        results,
+        key=lambda item: item["best_cv_roc_auc"],
+        reverse=True,
+    ), f, indent=2)
 
-    with open(METRICS_PATH, "w") as f:
-        json.dump({"best_model": best_name, "models": results}, f, indent=2)
+# Save split data so evaluation uses the exact same test rows
+X_test.to_csv(MODEL_DIR / "X_test.csv", index=False)
+y_test.to_csv(MODEL_DIR / "y_test.csv", index=False)
 
-    # Wilcoxon signed-rank test: is the best model SIGNIFICANTLY better
-    # than each other model, or could the difference be chance?
-    stats_results = run_wilcoxon_tests(cv_fold_scores, best_name)
-    with open(STATS_PATH, "w") as f:
-        json.dump(stats_results, f, indent=2)
+with open(MODEL_DIR / "training_info.json", "w") as f:
+    json.dump({
+        "selected_model": best_name,
+        "best_cv_roc_auc": best_score,
+        "train_rows": len(X_train),
+        "test_rows": len(X_test),
+        "random_state": 42,
+    }, f, indent=2)
 
-    print(f"\nWilcoxon test results (comparing {best_name} to each other model):")
-    for model_name, r in stats_results.items():
-        print(f"  {model_name}: p-value={r['p_value']} ({'significant' if r['significant'] else 'not significant'})")
+print("\nSelected model:", best_name)
+print("Best CV ROC-AUC:", round(best_score, 4))
+print("Model artefacts saved to:", MODEL_DIR)
 
-    print(f"\nBest model saved to {BEST_MODEL_PATH}")
-    print(f"Metrics saved to {METRICS_PATH}")
-    print(f"Statistical test results saved to {STATS_PATH}")
-
-    return best_name, results, stats_results
-
-
-if __name__ == "__main__":
-    train_and_compare()

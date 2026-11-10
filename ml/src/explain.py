@@ -1,78 +1,96 @@
-"""
-explain.py
-----------
-UPGRADED to use real SHAP (SHapley Additive exPlanations), matching
-the paper's core contribution — global explanations (which features
-matter most overall) and local explanations (why THIS customer's
-prediction came out the way it did).
 
-You'll need to add `shap>=0.44` to ml/requirements.txt.
-"""
-
-import shap
+from pathlib import Path
+import json
+import joblib
 import numpy as np
 import pandas as pd
+import shap
 
+ROOT = Path(__file__).resolve().parents[2]
+MODEL_DIR = ROOT / "ml" / "models"
 
-def get_shap_explainer(model):
-    """Tree-based models (all 4 of yours) use the fast TreeExplainer."""
-    return shap.TreeExplainer(model)
+preprocessor = joblib.load(MODEL_DIR / "preprocessor.pkl")
+model = joblib.load(MODEL_DIR / "best_model.pkl")
 
+X_test = pd.read_csv(MODEL_DIR / "X_test.csv")
 
-def get_global_explanation(model, X_sample: pd.DataFrame, save_path: str = None):
-    """
-    Global explanation: which features matter most ACROSS ALL customers.
-    X_sample should be a few hundred rows from your training set — you
-    don't need the whole dataset, SHAP on the full set is slow.
+# Use a manageable sample for explainability
+sample_size = min(200, len(X_test))
+X_sample = X_test.sample(n=sample_size, random_state=42)
 
-    If save_path is given (e.g. "ml/models/shap_beeswarm.png"), saves
-    the beeswarm plot as an image — useful to drop straight into your
-    report or PPT.
-    """
-    explainer = get_shap_explainer(model)
-    shap_values = explainer.shap_values(X_sample)
+X_transformed = preprocessor.transform(X_sample)
 
-    # Some models return a list (one array per class) — take the churn class
-    if isinstance(shap_values, list):
-        shap_values = shap_values[1]
+if hasattr(X_transformed, "toarray"):
+    X_transformed = X_transformed.toarray()
 
-    mean_abs_shap = np.abs(shap_values).mean(axis=0)
-    ranked = sorted(
-        zip(X_sample.columns, mean_abs_shap), key=lambda x: x[1], reverse=True
-    )
+X_transformed = np.asarray(X_transformed)
 
-    if save_path:
-        import matplotlib.pyplot as plt
-        shap.summary_plot(shap_values, X_sample, show=False)
-        plt.tight_layout()
-        plt.savefig(save_path, dpi=150)
-        plt.close()
+with open(MODEL_DIR / "feature_names.json") as f:
+    feature_names = json.load(f)
 
-    return [{"feature": f, "mean_abs_shap": round(float(v), 4)} for f, v in ranked]
+# Build a DataFrame so feature names are retained
+X_explain = pd.DataFrame(
+    X_transformed, columns=feature_names
+)
 
+# Explain the probability of churn (class 1).
+# A model-agnostic explainer works across the four classifiers.
+background = X_explain.sample(
+    n=min(50, len(X_explain)), random_state=42
+)
 
-def get_local_explanation(model, X_row: pd.DataFrame, top_n: int = 4) -> list:
-    """
-    Local explanation: why did THIS specific customer get this prediction?
-    Returns the top features pushing this one prediction toward or away
-    from churn — this is what the backend calls per prediction.
-    """
-    explainer = get_shap_explainer(model)
-    shap_values = explainer.shap_values(X_row)
+explainer = shap.Explainer(
+    lambda data: model.predict_proba(
+        np.asarray(data)
+    )[:, 1],
+    background,
+)
 
-    if isinstance(shap_values, list):
-        shap_values = shap_values[1]
+shap_values = explainer(X_explain)
 
-    row_values = shap_values[0] if shap_values.ndim > 1 else shap_values
-    feature_names = X_row.columns.tolist()
+# Global feature importance: mean absolute SHAP value
+importance = np.abs(shap_values.values).mean(axis=0)
 
-    ranked_idx = np.argsort(np.abs(row_values))[::-1][:top_n]
+global_importance = pd.DataFrame({
+    "feature": feature_names,
+    "mean_abs_shap": importance,
+}).sort_values("mean_abs_shap", ascending=False)
 
-    return [
-        {
-            "feature": feature_names[i],
-            "shap_value": round(float(row_values[i]), 4),
-            "direction": "increases churn risk" if row_values[i] > 0 else "decreases churn risk",
-        }
-        for i in ranked_idx
-    ]
+global_importance.to_csv(
+    MODEL_DIR / "shap_global_importance.csv", index=False
+)
+
+print("\nTop 10 global churn drivers:")
+print(global_importance.head(10).to_string(index=False))
+
+# Individual explanations
+individual_results = []
+
+for row_idx in range(len(X_explain)):
+    row_values = shap_values.values[row_idx]
+    top_indices = np.argsort(np.abs(row_values))[::-1][:5]
+
+    top_factors = []
+    for idx in top_indices:
+        top_factors.append({
+            "feature": feature_names[int(idx)],
+            "shap_value": float(row_values[idx]),
+            "direction": (
+                "increases churn prediction"
+                if row_values[idx] > 0
+                else "decreases churn prediction"
+            ),
+        })
+
+    individual_results.append({
+        "sample_index": int(row_idx),
+        "predicted_churn_probability": float(
+            model.predict_proba(X_transformed[row_idx:row_idx + 1])[0, 1]
+        ),
+        "top_factors": top_factors,
+    })
+
+with open(MODEL_DIR / "shap_customer_explanations.json", "w") as f:
+    json.dump(individual_results, f, indent=2)
+
+print("\nSaved global and individual SHAP explanations.")
